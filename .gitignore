@@ -1,0 +1,14 @@
+# Build intermediates and the rendered video stay out of the entry.
+video/final.mp4
+video/music.wav
+video/intro.mp4
+video/gameplay.mp4
+video/clip.mp4
+video/clip_card.mp4
+video/hold.mp4
+video/page@*.webm
+video/last.png
+video/concat.txt
+video/final_concat.txt
+video/shot-play-*.png
+out/

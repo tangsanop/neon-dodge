@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpolygon points='16,2 28,28 16,22 4,28' fill='%237df9ff'/%3E%3C/svg%3E">
+<title>NEON DODGE — built from one prompt</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05030f; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; font-family: "Segoe UI", system-ui, sans-serif; }
+  #wrap { position: relative; width: min(100vw, 177.78vh); aspect-ratio: 16 / 9; }
+  canvas { display: block; width: 100%; height: 100%; background: #05030f; }
+  #hint { position: absolute; left: 0; right: 0; bottom: 8px; text-align: center;
+          color: #8f8fb8; font-size: 13px; letter-spacing: 1px; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div id="hint">ARROWS / MOUSE to steer &nbsp;•&nbsp; P pause &nbsp;•&nbsp; M mute &nbsp;•&nbsp; R restart</div>
+</div>
+<script>
+"use strict";
+/* NEON DODGE — a tiny neon arcade dodger.
+   Steer the ship, dodge the asteroids, grab the stars. 3 lives. */
+
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const W = 960, H = 540;
+
+const G = {
+  mode: "title",        // title | playing | paused | over
+  t: 0, score: 0, best: 0,
+  lives: 3, level: 1, spawnT: 0, starT: 0,
+  ship: { x: W / 2, y: H - 90, r: 16, vx: 0, tilt: 0 },
+  rocks: [], stars: [], parts: [], floats: [],
+  keys: {}, mouseX: null, shake: 0, muted: false,
+  flashes: 0,
+};
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
+
+/* ---- audio: tiny WebAudio bleeps, no files ---- */
+let AC = null;
+function beep(freq, dur, type, vol, slide) {
+  if (G.muted) return;
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    if (AC.state === "suspended") AC.resume();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || "square";
+    o.frequency.setValueAtTime(freq, AC.currentTime);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, slide), AC.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.08, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + dur);
+  } catch (e) { /* audio unavailable: play silent */ }
+}
+
+/* ---- background starfield ---- */
+const bgStars = [];
+for (let i = 0; i < 90; i++) bgStars.push({ x: rand(0, W), y: rand(0, H), s: rand(0.5, 2.2), v: rand(8, 42) });
+
+function reset() {
+  G.score = 0; G.lives = 3; G.level = 1; G.spawnT = 0; G.starT = 0;
+  G.rocks = []; G.stars = []; G.parts = []; G.floats = [];
+  G.ship.x = W / 2; G.ship.y = H - 90; G.ship.vx = 0; G.shake = 0;
+  G.mode = "playing";
+}
+
+function spawnRock() {
+  const r = rand(14, 34);
+  G.rocks.push({
+    x: rand(r, W - r), y: -r - 10, r,
+    vy: rand(90, 150) + G.level * 22,
+    vx: rand(-30, 30), rot: rand(0, 6.28), vr: rand(-1.6, 1.6),
+    pts: 7 + ((Math.random() * 3) | 0), seed: Math.random() * 10,
+  });
+}
+function spawnStar() {
+  G.stars.push({ x: rand(24, W - 24), y: -20, r: 11, vy: rand(80, 120), ph: rand(0, 6.28) });
+}
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, 6.283), s = rand(speed * 0.3, speed);
+    G.parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(0.3, 0.8), max: 0.8, color, r: rand(1.5, 3.5) });
+  }
+}
+function floatText(x, y, text, color) {
+  G.floats.push({ x, y, text, color, life: 0.9 });
+}
+
+function hitShip() {
+  G.lives--;
+  G.shake = 14;
+  burst(G.ship.x, G.ship.y, "#ff2d78", 26, 260);
+  beep(160, 0.35, "sawtooth", 0.12, 40);
+  if (G.lives <= 0) {
+    G.mode = "over";
+    G.best = Math.max(G.best, G.score);
+    burst(G.ship.x, G.ship.y, "#7df9ff", 40, 320);
+  } else {
+    G.ship.x = W / 2; G.ship.vx = 0;
+  }
+}
+
+/* ---- fixed-step simulation ---- */
+const STEP = 1 / 60;
+let acc = 0, last = 0;
+function step(dt) {
+  G.t += dt;
+  for (const s of bgStars) { s.y += s.v * dt; if (s.y > H) { s.y = -2; s.x = rand(0, W); } }
+  for (const p of G.parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.98; p.vy *= 0.98; p.life -= dt; }
+  G.parts = G.parts.filter(p => p.life > 0);
+  for (const f of G.floats) { f.y -= 34 * dt; f.life -= dt; }
+  G.floats = G.floats.filter(f => f.life > 0);
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - 40 * dt);
+  if (G.mode !== "playing") return;
+
+  // ship steering: keys, then mouse
+  const s = G.ship;
+  let ax = 0;
+  if (G.keys.ArrowLeft || G.keys.KeyA) ax -= 1;
+  if (G.keys.ArrowRight || G.keys.KeyD) ax += 1;
+  if (ax !== 0) {
+    s.vx += ax * 2600 * dt;
+    G.mouseX = null;
+  } else if (G.mouseX !== null) {
+    const dx = G.mouseX - s.x;
+    s.vx += clamp(dx * 14, -2600, 2600) * dt;
+  }
+  s.vx *= Math.pow(0.12, dt);           // snappy damping
+  s.vx = clamp(s.vx, -560, 560);
+  s.x = clamp(s.x + s.vx * dt, 24, W - 24);
+  s.tilt = clamp(s.vx / 560, -1, 1) * 0.45;
+
+  // difficulty ramps with score
+  G.level = 1 + Math.floor(G.score / 250);
+
+  G.spawnT -= dt;
+  if (G.spawnT <= 0) { spawnRock(); G.spawnT = rand(0.28, 0.62) / (1 + G.level * 0.12); }
+  G.starT -= dt;
+  if (G.starT <= 0) { spawnStar(); G.starT = rand(1.4, 2.6); }
+
+  for (const r of G.rocks) {
+    r.y += r.vy * dt; r.x += r.vx * dt; r.rot += r.vr * dt;
+    if (r.x < r.r) { r.x = r.r; r.vx = Math.abs(r.vx); }
+    if (r.x > W - r.r) { r.x = W - r.r; r.vx = -Math.abs(r.vx); }
+    if (r.y - r.r > H) { r.dead = true; G.score += 2; }   // survived one
+  }
+  G.rocks = G.rocks.filter(r => !r.dead);
+
+  for (const st of G.stars) {
+    st.y += st.vy * dt; st.ph += dt * 5;
+    if (st.y > H + 20) st.dead = true;
+    if (dist2(st.x, st.y, s.x, s.y) < (st.r + s.r) * (st.r + s.r)) {
+      st.dead = true;
+      G.score += 25;
+      burst(st.x, st.y, "#ffd23f", 12, 160);
+      floatText(st.x, st.y - 14, "+25", "#ffd23f");
+      beep(880, 0.12, "sine", 0.1, 1320);
+    }
+  }
+  G.stars = G.stars.filter(st => !st.dead);
+
+  for (const r of G.rocks) {
+    if (dist2(r.x, r.y, s.x, s.y) < (r.r + s.r - 6) * (r.r + s.r - 6)) {
+      r.dead = true;
+      hitShip();
+      break;
+    }
+  }
+  G.rocks = G.rocks.filter(r => !r.dead);
+}
+
+/* ---- rendering ---- */
+function drawRock(r) {
+  ctx.save();
+  ctx.translate(r.x, r.y);
+  ctx.rotate(r.rot);
+  ctx.beginPath();
+  for (let i = 0; i < r.pts; i++) {
+    const a = (i / r.pts) * 6.283;
+    const rr = r.r * (0.78 + 0.22 * Math.abs(Math.sin(r.seed + i * 2.7)));
+    i === 0 ? ctx.moveTo(Math.cos(a) * rr, Math.sin(a) * rr) : ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+  }
+  ctx.closePath();
+  ctx.fillStyle = "#2a1b3d";
+  ctx.fill();
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = "#ff5d8f";
+  ctx.shadowColor = "#ff2d78";
+  ctx.shadowBlur = 14;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawShip() {
+  const s = G.ship;
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.rotate(s.tilt);
+  // engine flame
+  const fl = 12 + Math.sin(G.t * 22) * 5;
+  ctx.beginPath();
+  ctx.moveTo(-7, 14); ctx.lineTo(0, 14 + fl); ctx.lineTo(7, 14);
+  ctx.closePath();
+  ctx.fillStyle = "#ff9f1c";
+  ctx.shadowColor = "#ff9f1c"; ctx.shadowBlur = 18;
+  ctx.fill();
+  // hull
+  ctx.beginPath();
+  ctx.moveTo(0, -20); ctx.lineTo(14, 12); ctx.lineTo(5, 8); ctx.lineTo(-5, 8); ctx.lineTo(-14, 12);
+  ctx.closePath();
+  ctx.fillStyle = "#7df9ff";
+  ctx.shadowColor = "#00e5ff"; ctx.shadowBlur = 22;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(0, -4, 4.5, 0, 6.283);
+  ctx.fillStyle = "#ffffff";
+  ctx.fill();
+  ctx.restore();
+}
+
+function draw() {
+  ctx.save();
+  if (G.shake > 0) ctx.translate(rand(-G.shake, G.shake) * 0.4, rand(-G.shake, G.shake) * 0.4);
+  // nebula wash
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, "#0a0624"); grad.addColorStop(0.6, "#05030f"); grad.addColorStop(1, "#160a2e");
+  ctx.fillStyle = grad;
+  ctx.fillRect(-20, -20, W + 40, H + 40);
+  for (const s of bgStars) {
+    ctx.globalAlpha = 0.35 + 0.45 * Math.abs(Math.sin(G.t * 2 + s.x));
+    ctx.fillStyle = "#cdd6ff";
+    ctx.fillRect(s.x, s.y, s.s, s.s);
+  }
+  ctx.globalAlpha = 1;
+
+  for (const st of G.stars) {
+    const tw = 0.7 + 0.3 * Math.sin(st.ph);
+    ctx.save();
+    ctx.translate(st.x, st.y);
+    ctx.rotate(st.ph * 0.4);
+    ctx.fillStyle = "#ffd23f";
+    ctx.shadowColor = "#ffd23f"; ctx.shadowBlur = 16 * tw;
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * 6.283, rr = i % 2 === 0 ? st.r : st.r * 0.45;
+      i === 0 ? ctx.moveTo(Math.cos(a) * rr, Math.sin(a) * rr) : ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  for (const r of G.rocks) drawRock(r);
+  if (G.mode !== "over") drawShip();
+  for (const p of G.parts) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = "center";
+  for (const f of G.floats) {
+    ctx.globalAlpha = Math.max(0, f.life / 0.9);
+    ctx.font = "bold 20px 'Segoe UI', sans-serif";
+    ctx.fillStyle = f.color;
+    ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // HUD
+  ctx.textAlign = "left";
+  ctx.font = "bold 26px 'Segoe UI', sans-serif";
+  ctx.fillStyle = "#ffffff";
+  ctx.shadowColor = "#00e5ff"; ctx.shadowBlur = 12;
+  ctx.fillText("SCORE " + G.score, 18, 38);
+  ctx.shadowBlur = 0;
+  ctx.textAlign = "right";
+  ctx.font = "bold 18px 'Segoe UI', sans-serif";
+  ctx.fillStyle = "#8f8fb8";
+  ctx.fillText("LEVEL " + G.level, W - 18, 34);
+  // lives as hearts
+  for (let i = 0; i < 3; i++) {
+    const x = W - 30 - i * 30, y = 58;
+    ctx.fillStyle = i < G.lives ? "#ff2d78" : "#3a2b52";
+    ctx.beginPath();
+    ctx.arc(x - 5, y, 6, 0, 6.283); ctx.arc(x + 5, y, 6, 0, 6.283); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(x - 10, y + 2); ctx.lineTo(x, y + 11); ctx.lineTo(x + 10, y + 2); ctx.closePath(); ctx.fill();
+  }
+
+  if (G.mode === "title") overlay("NEON DODGE", "one prompt. one ship. zero mercy.", "PRESS ENTER OR CLICK TO PLAY");
+  if (G.mode === "paused") overlay("PAUSED", "take a breath, pilot", "PRESS P TO RESUME");
+  if (G.mode === "over") overlay("GAME OVER", "score " + G.score + "  •  best " + G.best, "PRESS R TO FLY AGAIN");
+}
+
+function overlay(title, sub, cta) {
+  ctx.fillStyle = "rgba(5,3,15,0.62)";
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.shadowColor = "#ff2d78"; ctx.shadowBlur = 26;
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 64px 'Segoe UI', sans-serif";
+  ctx.fillText(title, W / 2, H / 2 - 30);
+  ctx.shadowBlur = 0;
+  ctx.font = "26px 'Segoe UI', sans-serif";
+  ctx.fillStyle = "#7df9ff";
+  ctx.fillText(sub, W / 2, H / 2 + 14);
+  ctx.font = "bold 18px 'Segoe UI', sans-serif";
+  ctx.fillStyle = "#ffd23f";
+  ctx.globalAlpha = 0.65 + 0.35 * Math.sin(G.t * 4);
+  ctx.fillText(cta, W / 2, H / 2 + 62);
+  ctx.globalAlpha = 1;
+}
+
+function frame(ts) {
+  requestAnimationFrame(frame);
+  if (!last) last = ts;
+  let dt = (ts - last) / 1000;
+  last = ts;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt;
+  while (acc >= STEP) { step(STEP); acc -= STEP; }
+  draw();
+}
+
+/* ---- input ---- */
+window.addEventListener("keydown", e => {
+  G.keys[e.code] = true;
+  if (e.code === "Enter" && (G.mode === "title" || G.mode === "over")) { reset(); beep(660, 0.1, "sine", 0.09, 990); }
+  if (e.code === "KeyR" && (G.mode === "over" || G.mode === "playing" || G.mode === "paused")) reset();
+  if (e.code === "KeyP" && G.mode === "playing") G.mode = "paused";
+  else if (e.code === "KeyP" && G.mode === "paused") G.mode = "playing";
+  if (e.code === "KeyM") G.muted = !G.muted;
+  if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space"].includes(e.code)) e.preventDefault();
+});
+window.addEventListener("keyup", e => { G.keys[e.code] = false; });
+cv.addEventListener("pointermove", e => {
+  const r = cv.getBoundingClientRect();
+  G.mouseX = (e.clientX - r.left) * (W / r.width);
+});
+cv.addEventListener("pointerdown", () => {
+  if (G.mode === "title" || G.mode === "over") reset();
+});
+window.addEventListener("blur", () => { if (G.mode === "playing") G.mode = "paused"; });
+
+/* ---- deterministic hooks for scripted playtests ---- */
+window.advanceTime = function (ms) {
+  const n = Math.round(ms / (STEP * 1000));
+  for (let i = 0; i < n; i++) step(STEP);
+  draw();
+};
+window.render_game_to_text = function () {
+  return JSON.stringify({
+    mode: G.mode, score: G.score, lives: G.lives, level: G.level,
+    ship: { x: Math.round(G.ship.x), y: Math.round(G.ship.y) },
+    rocks: G.rocks.length, stars: G.stars.length,
+  });
+};
+window.__game = G;
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
